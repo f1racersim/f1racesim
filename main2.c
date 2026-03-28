@@ -6,6 +6,9 @@
 #include <mujoco/mujoco.h>
 #include <GLFW/glfw3.h>
 
+// ROS3 / Mirage Headers
+#include "ros3.h"
+
 // --- GLOBALS ---
 mjModel* m = NULL;
 mjData* d = NULL;
@@ -20,13 +23,13 @@ bool track_mode = true;
 bool button_left = false, button_right = false;
 double lastx = 0, lasty = 0;
 
-// High-density count for full-body visualization
+// Particle System
 #define MAX_PARTICLES 3000 
 typedef struct {
     float x, y, z;
     bool active;
     float age;
-    int type; // 0=body flow, 1=wingtip
+    int type; 
 } Particle;
 Particle particles[MAX_PARTICLES];
 
@@ -36,7 +39,7 @@ typedef struct {
 } VLMAeroProperties;
 static VLMAeroProperties v22_wing;
 
-// --- KEYBOARD ---
+// --- KEYBOARD CALLBACK ---
 void keyboard(GLFWwindow* window, int key, int scancode, int act, int mods) {
     if (act != GLFW_PRESS && act != GLFW_REPEAT) return;
     if (key == GLFW_KEY_U) wind_speed -= 1.0;
@@ -51,7 +54,7 @@ void keyboard(GLFWwindow* window, int key, int scancode, int act, int mods) {
     }
 }
 
-// --- MOUSE (RESTORED) ---
+// --- MOUSE CALLBACKS ---
 void mouse_button(GLFWwindow* window, int button, int act, int mods) {
     button_left = (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS);
     button_right = (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS);
@@ -67,7 +70,7 @@ void mouse_move(GLFWwindow* window, double xpos, double ypos) {
     mjv_moveCamera(m, action, dx/height, dy/height, &scn, &cam);
 }
 
-// --- AERODYNAMICS ---
+// --- AERODYNAMICS CALLBACK ---
 void aerodynamics_callback(const mjModel* m, mjData* d) {
     int jnt_id = mj_name2id(m, mjOBJ_JOINT, "tilt_joint");
     if (jnt_id != -1) d->qpos[m->jnt_qposadr[jnt_id]] = tilt_angle;
@@ -91,56 +94,73 @@ void aerodynamics_callback(const mjModel* m, mjData* d) {
 }
 
 int main(int argc, char** argv) {
-    // 1. DYNAMIC LOADING: Use terminal argument or default to V22
+    // --- 1. ROS3 & XBOX INITIALIZATION ---
+    rose_node *node = rose_init((char)argc, argv, "v22_xbox_sim", NULL, NULL);
+    rose_subscriber *sub = rose_create_sub(node, "/xbox/controller", -1, 1, NULL);
+    mirage_msg *msg = mirage_create(1024, NULL);
+
+    char fn_name[32];
+    i64 nlen = 0, f_argc = 0;
+    double axis_lx = 0, axis_ly = 0, trig_l = 0, axis_rx = 0;
+
+    // --- 2. MUJOCO SETUP ---
     char* model_path = "testdata/v22_drone.xml";
     if (argc > 1) model_path = argv[1];
 
-    glfwInit();
-    
-    // Load the model and check for errors
+    if (!glfwInit()) return 1;
     char error[1000];
     m = mj_loadXML(model_path, NULL, error, 1000);
-    if (!m) {
-        printf("Error: %s\n", error);
-        return 1;
-    }
-
+    if (!m) { printf("Error: %s\n", error); return 1; }
     d = mj_makeData(m);
     mjcb_passive = aerodynamics_callback;
 
-    // 2. FIND GEOMS BY NAME: This makes the code work with different vehicles
     int wid = mj_name2id(m, mjOBJ_GEOM, "wing_geom");
     int bid = mj_name2id(m, mjOBJ_GEOM, "fuselage");
-    
-    // Fallback if the XML doesn't use those names
     if (wid == -1) wid = 0; 
     if (bid == -1) bid = 0;
-
     v22_wing = (VLMAeroProperties){wid, 4.8, 0.15, 0.02, 0.05, 0.3};
 
-    GLFWwindow* window = glfwCreateWindow(1200, 900, "V22 Volumetric VLM", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(1200, 900, "V22 Volumetric VLM - Xbox Integrated", NULL, NULL);
     glfwMakeContextCurrent(window);
-    
-    // CALLBACK REGISTRATION
     glfwSetKeyCallback(window, keyboard);
     glfwSetMouseButtonCallback(window, mouse_button);
     glfwSetCursorPosCallback(window, mouse_move);
 
     mjv_defaultCamera(&cam); mjv_defaultOption(&opt); mjv_defaultScene(&scn); mjr_defaultContext(&con);
     cam.type = mjCAMERA_TRACKING; cam.trackbodyid = mj_name2id(m, mjOBJ_BODY, "v22_body");
-    mjv_makeScene(m, &scn, 10000); // Increased limit for more lines
+    mjv_makeScene(m, &scn, 10000);
     mjr_makeContext(m, &con, mjFONTSCALE_150);
 
-    while (!glfwWindowShouldClose(window)) {
+    // --- 3. MAIN LOOP ---
+    while (!glfwWindowShouldClose(window) && rose_ok(node)) {
+        
+        // POLL XBOX CONTROLLER
+        if (rose_read(sub, msg) >= 0) {
+            mirage_read_start(msg);
+            mirage_read_fn(msg, fn_name, &nlen, sizeof(fn_name), &f_argc);
+            
+            if (f_argc >= 4) {
+                mirage_read_f64(msg, &axis_lx); // Element 0
+                mirage_read_f64(msg, &axis_ly); // Element 1
+                mirage_read_f64(msg, &trig_l);  // Element 2
+                mirage_read_f64(msg, &axis_rx); // Element 3
+
+                // MAPPING: Stick Y controls Wing Tilt (inverted usually feels better for flight)
+                tilt_angle = -axis_ly * 0.7; 
+                
+                // MAPPING: Stick X controls Wind Speed offset
+                wind_speed = -15.0 + (axis_rx * 5.0);
+            }
+        }
+
         mjtNum simstart = d->time;
         while (d->time - simstart < 1.0/60.0) mj_step(m, d);
         mjv_updateScene(m, d, &opt, NULL, &cam, mjCAT_ALL, &scn);
 
-        // --- VOLUMETRIC SPAWN ---
+        // --- PARTICLE LOGIC ---
         static int timer = 0;
         if (timer++ > 1) {
             timer = 0;
-            // Spawning a 3D block: dy=-0.8 to 0.8, dz=-0.4 to 0.4
             for(double dy = -0.8; dy <= 0.8; dy += 0.12) {
                 for(double dz = -0.4; dz <= 0.4; dz += 0.12) {
                     for(int i=0; i<MAX_PARTICLES; i++) {
@@ -157,24 +177,20 @@ int main(int argc, char** argv) {
             }
         }
 
-        // --- DYNAMICS ---
         for(int i=0; i<MAX_PARTICLES; i++) {
             if(!particles[i].active) continue;
-            
             float dx_b = particles[i].x - d->geom_xpos[3*bid];
             float dy_b = particles[i].y - d->geom_xpos[3*bid+1];
             float dz_b = particles[i].z - d->geom_xpos[3*bid+2];
             float dist_sq = dx_b*dx_b + dy_b*dy_b + dz_b*dz_b;
             float vy = 0, vz = 0;
 
-            // Body Displacement (Wrap around fuselage)
             if (dist_sq < 0.5) {
                 float repulsion = (0.5 - dist_sq) * 2.5;
                 vy += (dy_b > 0 ? 1 : -1) * repulsion;
                 vz += (dz_b > 0 ? 1 : -1) * repulsion;
             }
 
-            // Wing Downwash
             float dx_w = particles[i].x - d->geom_xpos[3*wid];
             if (fabs(dx_w) < 0.3 && fabs(dy_b) < 0.7) {
                 vz -= (dx_w < 0) ? 1.6 : -0.5; 
@@ -188,35 +204,42 @@ int main(int argc, char** argv) {
             if (particles[i].age > 1.2) particles[i].active = false;
 
             if (scn.ngeom < scn.maxgeom) {
-                        mjv_initGeom(&scn.geoms[scn.ngeom], mjGEOM_LINE, NULL, NULL, NULL, NULL);
-                        mjv_makeConnector(&scn.geoms[scn.ngeom], mjGEOM_LINE, 0.002, 
-                        prev[0], prev[1], prev[2], 
-                        particles[i].x, particles[i].y, particles[i].z);
-                            
-                        // COLORING BY VELOCITY MAGNITUDE
-                        // We compare the total local speed to the base wind speed
-                        float current_v = sqrt(pow(wind_speed, 2) + pow(vy, 2) + pow(vz, 2));
-                        float speed_diff = (current_v - fabs(wind_speed)) / 3.0; // Sensitivity 
-                        float speed_factor = mju_clip(speed_diff, -1.0, 1.0);
+                mjv_initGeom(&scn.geoms[scn.ngeom], mjGEOM_LINE, NULL, NULL, NULL, NULL);
+                mjv_makeConnector(&scn.geoms[scn.ngeom], mjGEOM_LINE, 0.002, 
+                                  prev[0], prev[1], prev[2], 
+                                  particles[i].x, particles[i].y, particles[i].z);
+                
+                float current_v = sqrt(pow(wind_speed, 2) + pow(vy, 2) + pow(vz, 2));
+                float speed_diff = (current_v - fabs(wind_speed)) / 3.0; 
+                float speed_factor = mju_clip(speed_diff, -1.0, 1.0);
 
-                        // Gradient: Red (Fast/Compression) -> White (Normal) -> Blue (Slow/Wake)
-                        scn.geoms[scn.ngeom].rgba[0] = 0.5 + (0.5 * speed_factor); // Red channel
-                        scn.geoms[scn.ngeom].rgba[1] = 0.8 - (0.5 * fabs(speed_factor)); // Green channel
-                        scn.geoms[scn.ngeom].rgba[2] = 0.5 - (0.5 * speed_factor); // Blue channel
-                            
-                        float fade = 1.0 - (particles[i].age / 1.2);
-                        scn.geoms[scn.ngeom].rgba[3] = fade;
-                        scn.ngeom++;
+                scn.geoms[scn.ngeom].rgba[0] = 0.5 + (0.5 * speed_factor);
+                scn.geoms[scn.ngeom].rgba[1] = 0.8 - (0.5 * fabs(speed_factor));
+                scn.geoms[scn.ngeom].rgba[2] = 0.5 - (0.5 * speed_factor);
+                scn.geoms[scn.ngeom].rgba[3] = 1.0 - (particles[i].age / 1.2);
+                scn.ngeom++;
             }
         }
 
         mjrRect viewport = {0, 0, 0, 0};
         glfwGetFramebufferSize(window, &viewport.width, &viewport.height);
         mjr_render(viewport, &scn, &con);
-        char hud[64]; sprintf(hud, "Wind: %.1f m/s | Particles: %d", fabs(wind_speed), MAX_PARTICLES);
-        mjr_overlay(mjFONT_BIG, mjGRID_TOPLEFT, viewport, hud, "Mouse to Look | Arrow Keys for Tilt", &con);
+        
+        char hud[128]; 
+        sprintf(hud, "Wind: %.1f | Tilt: %.2f | Controller: Connected", fabs(wind_speed), tilt_angle);
+        mjr_overlay(mjFONT_BIG, mjGRID_TOPLEFT, viewport, hud, "Xbox: Left Stick (Tilt) | Right Stick (Wind)", &con);
+        
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
+
+    // --- 4. CLEANUP ---
+    mirage_destroy(&msg, NULL);
+    mj_deleteData(d);
+    mj_deleteModel(m);
+    mjr_freeContext(&con);
+    mjv_freeScene(&scn);
+    glfwTerminate();
+    
     return 0;
 }
