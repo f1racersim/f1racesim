@@ -1,0 +1,18 @@
+<mujoco model="v22_drone">
+    <option gravity="0 0 -9.81" timestep="0.002"/>
+
+    <worldbody>
+        <light directional="true" diffuse=".8 .8 .8" specular=".2 .2 .2" pos="0 0 5" dir="0 0 -1"/>
+        <geom name="floor" type="plane" size="10 10 .1" rgba=".8 .9 .8 1"/>
+
+        <body name="v22_body" pos="0 0 0.2">
+            <freejoint name="root"/>
+            <geom name="fuselage" type="box" size="0.3 0.1 0.05" rgba="0.5 0.5 0.5 1" density="100"/>
+            
+            <body name="tilt_rotor_assembly" pos="0 0 0.05">
+                <joint name="tilt_joint" type="hinge" axis="0 1 0" range="-1.57 1.57" limited="true"/>
+                <geom name="wing_geom" type="box" size="0.15 0.6 0.01" rgba="0 0 1 0.7" density="100"/>
+            </body>
+        </body>
+    </worldbody>
+</mujoco>
