@@ -1,7 +1,21 @@
-.PHONY: all run
+.PHONY: all clean run
 
-all:
-	gcc -O2 main2.c -I$HOME/.mujoco/mujoco-3.1.3/include -L$HOME/.mujoco/mujoco-3.1.3/lib -lmujoco -lglfw -lm -lros3 -lmirage -lquicksand -o v22_sim
+CC := gcc
+MUJOCO_DIR := $(CURDIR)/.local/mujoco-3.6.0
+CFLAGS := -O2 -I$(MUJOCO_DIR)/include
+LDFLAGS := -L$(MUJOCO_DIR)/lib -Wl,-rpath,$(MUJOCO_DIR)/lib
+LDLIBS := -lmujoco -lglfw -lm -lros3 -lmirage -lquicksand
 
-run:
+all: v22_sim
+
+v22_sim: main2.o
+	$(CC) $^ $(LDFLAGS) $(LDLIBS) -o $@
+
+main2.o: main2.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+run: v22_sim
 	./v22_sim testdata/mcqueen.xml
+
+clean:
+	rm -f main2.o v22_sim

@@ -18,7 +18,6 @@ mjvScene scn;
 mjrContext con;
 
 double wind_speed = -15.0; 
-double tilt_angle = 0.0; 
 bool track_mode = true;
 bool button_left = false, button_right = false;
 double lastx = 0, lasty = 0;
@@ -34,19 +33,87 @@ typedef struct {
 Particle particles[MAX_PARTICLES];
 
 typedef struct {
+    int joint_id;
     int geom_id;
+    double angle;
     double cl_alpha, cl0, cd0, k_induced, area;
-} VLMAeroProperties;
-static VLMAeroProperties v22_wing;
+} AeroFlap;
+
+enum {
+    LEFT_FLAP = 0,
+    RIGHT_FLAP = 1,
+    NUM_FLAPS = 2
+};
+
+static AeroFlap flaps[NUM_FLAPS];
+static int flap_count = 0;
+static int fuselage_geom_id = -1;
+
+static double clamp_flap_angle(double angle) {
+    return mju_clip(angle, -1.2, 1.2);
+}
+
+static double normalize_trigger(double axis_value) {
+    return 0.5 * (mju_clip(axis_value, -1.0, 1.0) + 1.0);
+}
+
+static int lookup_id(const mjModel* model, int objtype, const char* name) {
+    return mj_name2id(model, objtype, name);
+}
+
+static void apply_flap_aero(const mjModel* model, mjData* data, AeroFlap* flap) {
+    mjtNum vel_world[6], local_vel[3], f_world[3];
+    mjtNum wind_vec[3] = {(mjtNum) wind_speed, 0, 0};
+
+    if (flap->joint_id != -1) {
+        data->qpos[model->jnt_qposadr[flap->joint_id]] = clamp_flap_angle(flap->angle);
+    }
+
+    if (flap->geom_id == -1) {
+        return;
+    }
+
+    mj_objectVelocity(model, data, mjOBJ_GEOM, flap->geom_id, vel_world, 0);
+    mjtNum airspeed_world[3] = {vel_world[3] - wind_vec[0], vel_world[4], vel_world[5]};
+    mju_mulMatTVec(local_vel, data->geom_xmat + 9 * flap->geom_id, airspeed_world, 3, 3);
+
+    double speed = mju_norm3(local_vel) + 1e-6;
+    double alpha = mju_clip(atan2(-local_vel[2], local_vel[0] + 1e-6), -0.8, 0.8);
+    double cl = flap->cl0 + (flap->cl_alpha * alpha);
+    double cd = flap->cd0 + (flap->k_induced * cl * cl);
+    double q_s = 0.5 * 1.225 * speed * speed * flap->area;
+
+    mjtNum f_local[3] = {(mjtNum)(-cd * q_s), 0, (mjtNum)(cl * q_s)};
+    mju_mulMatVec(f_world, data->geom_xmat + 9 * flap->geom_id, f_local, 3, 3);
+    mj_applyFT(model, data, f_world, NULL, data->geom_xpos + 3 * flap->geom_id,
+               model->geom_bodyid[flap->geom_id], data->qfrc_passive);
+}
 
 // --- KEYBOARD CALLBACK ---
 void keyboard(GLFWwindow* window, int key, int scancode, int act, int mods) {
     if (act != GLFW_PRESS && act != GLFW_REPEAT) return;
     if (key == GLFW_KEY_U) wind_speed -= 1.0;
     if (key == GLFW_KEY_J) wind_speed += 1.0;
-    if (key == GLFW_KEY_R) { mj_resetData(m, d); tilt_angle = 0; }
-    if (key == GLFW_KEY_UP) tilt_angle += 0.05;   
-    if (key == GLFW_KEY_DOWN) tilt_angle -= 0.05; 
+    if (key == GLFW_KEY_R) {
+        mj_resetData(m, d);
+        for (int flap_idx = 0; flap_idx < flap_count; flap_idx++) {
+            flaps[flap_idx].angle = 0.0;
+        }
+    }
+    if (key == GLFW_KEY_UP) {
+        for (int flap_idx = 0; flap_idx < flap_count; flap_idx++) {
+            flaps[flap_idx].angle = clamp_flap_angle(flaps[flap_idx].angle + 0.05);
+        }
+    }
+    if (key == GLFW_KEY_DOWN) {
+        for (int flap_idx = 0; flap_idx < flap_count; flap_idx++) {
+            flaps[flap_idx].angle = clamp_flap_angle(flaps[flap_idx].angle - 0.05);
+        }
+    }
+    if (flap_count > 0 && key == GLFW_KEY_A) flaps[LEFT_FLAP].angle = clamp_flap_angle(flaps[LEFT_FLAP].angle + 0.05);
+    if (flap_count > 0 && key == GLFW_KEY_Z) flaps[LEFT_FLAP].angle = clamp_flap_angle(flaps[LEFT_FLAP].angle - 0.05);
+    if (flap_count > 1 && key == GLFW_KEY_K) flaps[RIGHT_FLAP].angle = clamp_flap_angle(flaps[RIGHT_FLAP].angle + 0.05);
+    if (flap_count > 1 && key == GLFW_KEY_M) flaps[RIGHT_FLAP].angle = clamp_flap_angle(flaps[RIGHT_FLAP].angle - 0.05);
     if (key == GLFW_KEY_C) {
         track_mode = !track_mode;
         cam.type = track_mode ? mjCAMERA_TRACKING : mjCAMERA_FREE;
@@ -72,25 +139,13 @@ void mouse_move(GLFWwindow* window, double xpos, double ypos) {
 
 // --- AERODYNAMICS CALLBACK ---
 void aerodynamics_callback(const mjModel* m, mjData* d) {
-    int jnt_id = mj_name2id(m, mjOBJ_JOINT, "tilt_joint");
-    if (jnt_id != -1) d->qpos[m->jnt_qposadr[jnt_id]] = tilt_angle;
+    for (int flap_idx = 0; flap_idx < flap_count; flap_idx++) {
+        apply_flap_aero(m, d, &flaps[flap_idx]);
+    }
 
-    int gid = v22_wing.geom_id;
-    mjtNum vel_world[6], local_vel[3], f_world[3], wind_vec[3] = {wind_speed, 0, 0};
-    mj_objectVelocity(m, d, mjOBJ_GEOM, gid, vel_world, 0);
-    mjtNum airspeed_world[3] = {vel_world[3] - wind_vec[0], vel_world[4], vel_world[5]};
-    mju_mulMatTVec(local_vel, d->geom_xmat + 9 * gid, airspeed_world, 3, 3);
-
-    double V = mju_norm3(local_vel) + 1e-6;
-    double alpha = mju_clip(atan2(-local_vel[2], local_vel[0] + 1e-6), -0.5, 0.5); 
-    double cl = v22_wing.cl0 + (v22_wing.cl_alpha * alpha);
-    double cd = v22_wing.cd0 + (v22_wing.k_induced * cl * cl);
-    double q_s = 0.5 * 1.225 * V * V * v22_wing.area;
-    
-    mjtNum f_local[3] = {-cd * q_s, 0, cl * q_s};
-    mju_mulMatVec(f_world, d->geom_xmat + 9 * gid, f_local, 3, 3);
-    mj_applyFT(m, d, f_world, NULL, d->geom_xpos + 3 * gid, m->geom_bodyid[gid], d->qfrc_passive);
-    for(int i=3; i<6; i++) d->qfrc_passive[i] -= d->qvel[i] * 2.0;
+    for (int i = 3; i < 6 && i < m->nv; i++) {
+        d->qfrc_passive[i] -= d->qvel[i] * 2.0;
+    }
 }
 
 int main(int argc, char** argv) {
@@ -101,7 +156,7 @@ int main(int argc, char** argv) {
 
     char fn_name[32];
     i64 nlen = 0, f_argc = 0;
-    double axis_lx = 0, axis_ly = 0, trig_l = 0, axis_rx = 0;
+    double axis_lx = 0, axis_ly = 0, trig_l = -1.0, axis_rx = 0, axis_ry = 0, trig_r = -1.0;
 
     // --- 2. MUJOCO SETUP ---
     char* model_path = "testdata/v22_drone.xml";
@@ -114,11 +169,56 @@ int main(int argc, char** argv) {
     d = mj_makeData(m);
     mjcb_passive = aerodynamics_callback;
 
-    int wid = mj_name2id(m, mjOBJ_GEOM, "wing_geom");
-    int bid = mj_name2id(m, mjOBJ_GEOM, "fuselage");
-    if (wid == -1) wid = 0; 
-    if (bid == -1) bid = 0;
-    v22_wing = (VLMAeroProperties){wid, 4.8, 0.15, 0.02, 0.05, 0.3};
+    memset(flaps, 0, sizeof(flaps));
+    flap_count = 0;
+
+    int left_joint_id = lookup_id(m, mjOBJ_JOINT, "left_flap_joint");
+    int left_geom_id = lookup_id(m, mjOBJ_GEOM, "left_wing_geom");
+    int right_joint_id = lookup_id(m, mjOBJ_JOINT, "right_flap_joint");
+    int right_geom_id = lookup_id(m, mjOBJ_GEOM, "right_wing_geom");
+
+    if (left_joint_id != -1 && left_geom_id != -1 &&
+        right_joint_id != -1 && right_geom_id != -1) {
+        flap_count = 2;
+        flaps[LEFT_FLAP] = (AeroFlap){
+            .joint_id = left_joint_id,
+            .geom_id = left_geom_id,
+            .angle = 0.0,
+            .cl_alpha = 4.8,
+            .cl0 = 0.15,
+            .cd0 = 0.02,
+            .k_induced = 0.05,
+            .area = 0.15
+        };
+        flaps[RIGHT_FLAP] = (AeroFlap){
+            .joint_id = right_joint_id,
+            .geom_id = right_geom_id,
+            .angle = 0.0,
+            .cl_alpha = 4.8,
+            .cl0 = 0.15,
+            .cd0 = 0.02,
+            .k_induced = 0.05,
+            .area = 0.15
+        };
+    } else {
+        int single_joint_id = lookup_id(m, mjOBJ_JOINT, "tilt_joint");
+        int single_geom_id = lookup_id(m, mjOBJ_GEOM, "wing_geom");
+        if (single_joint_id != -1 && single_geom_id != -1) {
+            flap_count = 1;
+            flaps[LEFT_FLAP] = (AeroFlap){
+                .joint_id = single_joint_id,
+                .geom_id = single_geom_id,
+                .angle = 0.0,
+                .cl_alpha = 4.8,
+                .cl0 = 0.15,
+                .cd0 = 0.02,
+                .k_induced = 0.05,
+                .area = 0.3
+            };
+        }
+    }
+
+    fuselage_geom_id = lookup_id(m, mjOBJ_GEOM, "fuselage");
 
     GLFWwindow* window = glfwCreateWindow(1200, 900, "V22 Volumetric VLM - Xbox Integrated", NULL, NULL);
     glfwMakeContextCurrent(window);
@@ -141,15 +241,20 @@ int main(int argc, char** argv) {
             
             if (f_argc >= 4) {
                 mirage_read_f64(msg, &axis_lx); // Element 0
-                mirage_read_f64(msg, &axis_ly); // Element 1
-                mirage_read_f64(msg, &trig_l);  // Element 2
-                mirage_read_f64(msg, &axis_rx); // Element 3
+                mirage_read_f64(msg, &axis_ly); // Element 1: left stick Y
+                mirage_read_f64(msg, &trig_l);  // Element 2: left trigger
+                mirage_read_f64(msg, &axis_rx); // Element 3: right stick X
+                axis_ry = axis_rx;
+                if (f_argc >= 5) mirage_read_f64(msg, &axis_ry); // Element 4: right stick Y
+                if (f_argc >= 6) mirage_read_f64(msg, &trig_r);  // Element 5: right trigger
 
-                // MAPPING: Stick Y controls Wing Tilt (inverted usually feels better for flight)
-                tilt_angle = -axis_ly * 0.7; 
-                
-                // MAPPING: Stick X controls Wind Speed offset
-                wind_speed = -15.0 + (axis_rx * 5.0);
+                if (flap_count >= 2) {
+                    flaps[LEFT_FLAP].angle = clamp_flap_angle(-axis_ly * 0.9);
+                    flaps[RIGHT_FLAP].angle = clamp_flap_angle(-axis_ry * 0.9);
+                } else if (flap_count == 1) {
+                    flaps[LEFT_FLAP].angle = clamp_flap_angle(-axis_ly * 0.9);
+                }
+                wind_speed = -15.0 + ((normalize_trigger(trig_r) - normalize_trigger(trig_l)) * 5.0);
             }
         }
 
@@ -166,9 +271,15 @@ int main(int argc, char** argv) {
                     for(int i=0; i<MAX_PARTICLES; i++) {
                         if(!particles[i].active) {
                             particles[i].active = true; particles[i].age = 0;
-                            particles[i].x = d->geom_xpos[3*bid] + 2.0;
-                            particles[i].y = d->geom_xpos[3*bid+1] + dy;
-                            particles[i].z = d->geom_xpos[3*bid+2] + dz;
+                            if (fuselage_geom_id != -1) {
+                                particles[i].x = d->geom_xpos[3*fuselage_geom_id] + 2.0;
+                                particles[i].y = d->geom_xpos[3*fuselage_geom_id+1] + dy;
+                                particles[i].z = d->geom_xpos[3*fuselage_geom_id+2] + dz;
+                            } else {
+                                particles[i].x = 2.0;
+                                particles[i].y = dy;
+                                particles[i].z = dz;
+                            }
                             particles[i].type = (fabs(dy) > 0.5) ? 1 : 0; 
                             break;
                         }
@@ -179,9 +290,12 @@ int main(int argc, char** argv) {
 
         for(int i=0; i<MAX_PARTICLES; i++) {
             if(!particles[i].active) continue;
-            float dx_b = particles[i].x - d->geom_xpos[3*bid];
-            float dy_b = particles[i].y - d->geom_xpos[3*bid+1];
-            float dz_b = particles[i].z - d->geom_xpos[3*bid+2];
+            float body_x = fuselage_geom_id != -1 ? d->geom_xpos[3*fuselage_geom_id] : 0.0f;
+            float body_y = fuselage_geom_id != -1 ? d->geom_xpos[3*fuselage_geom_id+1] : 0.0f;
+            float body_z = fuselage_geom_id != -1 ? d->geom_xpos[3*fuselage_geom_id+2] : 0.0f;
+            float dx_b = particles[i].x - body_x;
+            float dy_b = particles[i].y - body_y;
+            float dz_b = particles[i].z - body_z;
             float dist_sq = dx_b*dx_b + dy_b*dy_b + dz_b*dz_b;
             float vy = 0, vz = 0;
 
@@ -191,9 +305,15 @@ int main(int argc, char** argv) {
                 vz += (dz_b > 0 ? 1 : -1) * repulsion;
             }
 
-            float dx_w = particles[i].x - d->geom_xpos[3*wid];
-            if (fabs(dx_w) < 0.3 && fabs(dy_b) < 0.7) {
-                vz -= (dx_w < 0) ? 1.6 : -0.5; 
+            for (int flap_idx = 0; flap_idx < flap_count; flap_idx++) {
+                int flap_geom_id = flaps[flap_idx].geom_id;
+                float dx_w = particles[i].x - d->geom_xpos[3*flap_geom_id];
+                float dy_w = particles[i].y - d->geom_xpos[3*flap_geom_id+1];
+
+                if (fabs(dx_w) < 0.3f && fabs(dy_w) < 0.35f) {
+                    vz -= (dx_w < 0 ? 1.2f : -0.3f);
+                    vz -= (float)(flaps[flap_idx].angle * 1.5);
+                }
             }
 
             float prev[3] = {particles[i].x, particles[i].y, particles[i].z};
@@ -204,10 +324,10 @@ int main(int argc, char** argv) {
             if (particles[i].age > 1.2) particles[i].active = false;
 
             if (scn.ngeom < scn.maxgeom) {
+                mjtNum from[3] = {prev[0], prev[1], prev[2]};
+                mjtNum to[3] = {particles[i].x, particles[i].y, particles[i].z};
                 mjv_initGeom(&scn.geoms[scn.ngeom], mjGEOM_LINE, NULL, NULL, NULL, NULL);
-                mjv_makeConnector(&scn.geoms[scn.ngeom], mjGEOM_LINE, 0.002, 
-                                  prev[0], prev[1], prev[2], 
-                                  particles[i].x, particles[i].y, particles[i].z);
+                mjv_connector(&scn.geoms[scn.ngeom], mjGEOM_LINE, 1.0, from, to);
                 
                 float current_v = sqrt(pow(wind_speed, 2) + pow(vy, 2) + pow(vz, 2));
                 float speed_diff = (current_v - fabs(wind_speed)) / 3.0; 
@@ -226,8 +346,21 @@ int main(int argc, char** argv) {
         mjr_render(viewport, &scn, &con);
         
         char hud[128]; 
-        sprintf(hud, "Wind: %.1f | Tilt: %.2f | Controller: Connected", fabs(wind_speed), tilt_angle);
-        mjr_overlay(mjFONT_BIG, mjGRID_TOPLEFT, viewport, hud, "Xbox: Left Stick (Tilt) | Right Stick (Wind)", &con);
+        if (flap_count >= 2) {
+            sprintf(hud, "Wind: %.1f | Left flap: %.2f | Right flap: %.2f",
+                    fabs(wind_speed), flaps[LEFT_FLAP].angle, flaps[RIGHT_FLAP].angle);
+            mjr_overlay(mjFONT_BIG, mjGRID_TOPLEFT, viewport, hud,
+                        "Xbox: Left Y -> left flap | Right Y -> right flap | Triggers -> wind", &con);
+        } else if (flap_count == 1) {
+            sprintf(hud, "Wind: %.1f | Flap: %.2f",
+                    fabs(wind_speed), flaps[LEFT_FLAP].angle);
+            mjr_overlay(mjFONT_BIG, mjGRID_TOPLEFT, viewport, hud,
+                        "Xbox: Left Y -> flap | Triggers -> wind", &con);
+        } else {
+            sprintf(hud, "Wind: %.1f | No flap surfaces detected", fabs(wind_speed));
+            mjr_overlay(mjFONT_BIG, mjGRID_TOPLEFT, viewport, hud,
+                        "Triggers -> wind", &con);
+        }
         
         glfwSwapBuffers(window);
         glfwPollEvents();
